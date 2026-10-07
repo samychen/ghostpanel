@@ -1,0 +1,17 @@
+include: package:flutter_lints/flutter.yaml
+
+analyzer:
+  errors:
+    # 演示工程：降级部分 lint，保证 analyze 聚焦真实错误
+    prefer_const_constructors: ignore
+    prefer_const_literals_to_create_immutables: ignore
+    use_build_context_synchronously: warning
+  exclude:
+    - build/**
+    - android/**
+    - web/**
+
+linter:
+  rules:
+    avoid_print: true
+    prefer_single_quotes: true

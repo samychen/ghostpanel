@@ -1,0 +1,16 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+.flutter-plugins
+.flutter-plugins-dependencies
+build/
+pubspec.lock
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# 平台目录（由 flutter create 生成后按需提交）
+android/.gradle/
+ios/Pods/
