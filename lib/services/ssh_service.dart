@@ -57,6 +57,11 @@ class SSHService {
   int _reconnectAttempt = 0;
   Timer? _reconnectTimer;
 
+  /// 正在进行中的连接 Future。仪表盘轮询、任务舱轮询、终端可能在同一时刻
+  /// 各自触发一次连接；若无互斥会并发建立多条 TCP/握手，彼此覆盖 `_client`，
+  /// 表现为界面长时间停在「连接中」。所有连接请求统一复用同一个 Future。
+  Future<void>? _connectInFlight;
+
   static const int maxReconnectAttempts = 12;
 
   // ---------------------------------------------------------------- 连接
@@ -67,6 +72,31 @@ class SSHService {
   }
 
   Future<void> _doConnect({bool throwOnError = false}) async {
+    final existing = _connectInFlight;
+    if (existing != null) {
+      // 已有连接在进行中：复用其结果，避免重复握手。
+      try {
+        await existing;
+      } catch (_) {
+        if (!throwOnError) return;
+        throw SSHServiceException(lastError ?? '连接失败');
+      }
+      return;
+    }
+
+    final future = _doConnectInner();
+    _connectInFlight = future;
+    try {
+      await future;
+    } on SSHServiceException catch (e) {
+      if (throwOnError) rethrow;
+      lastError = e.message;
+    } finally {
+      if (identical(_connectInFlight, future)) _connectInFlight = null;
+    }
+  }
+
+  Future<void> _doConnectInner() async {
     _setState(_reconnectAttempt > 0 ? LinkState.reconnecting : LinkState.connecting);
     try {
       _socket = await SSHSocket.connect(
@@ -94,10 +124,19 @@ class SSHService {
         },
       );
 
-      await _client!.authenticated;
+      // 认证/握手必须自带超时：dartssh2 的 authenticated Future 本身不会超时，
+      // 若服务端接受了 TCP 却不响应 SSH 横幅或密钥交换，UI 会永久停在「连接中」。
+      await _client!.authenticated.timeout(
+        const Duration(seconds: 15),
+        onTimeout: () => throw SSHServiceException(
+          'SSH 握手/认证超时：已建立 TCP 连接，但服务端 ${config.host}:${config.port} 未完成认证响应',
+        ),
+      );
 
-      // 连接建立后立即验证一次环境隔离（同时也确认通道可用）
-      await exec('true', timeout: const Duration(seconds: 8));
+      // 连接建立后立即验证一次环境隔离（同时也确认通道可用）。
+      // 注意：此刻 _state 仍是 connecting，绝不能走 exec() → _ensureConnected()，
+      // 否则会死等状态变成 connected，而 connected 又要等本次自检结束 —— 自我死锁。
+      await _execOn(_client!, 'true', timeout: const Duration(seconds: 8));
 
       _reconnectAttempt = 0;
       lastError = null;
@@ -109,7 +148,8 @@ class SSHService {
       lastError = _humanizeError(e);
       _cleanupSocket();
       _setState(LinkState.disconnected);
-      if (throwOnError) throw SSHServiceException(lastError!);
+      // 内层始终抛出，由外层 _doConnect 依据 throwOnError 决定吞掉还是上抛。
+      throw SSHServiceException(lastError!);
     }
   }
 
@@ -209,7 +249,20 @@ class SSHService {
     Duration? timeout,
   }) async {
     await _ensureConnected();
-    final client = _client!;
+    return _execOn(_client!, command, isolateEnv: isolateEnv, timeout: timeout);
+  }
+
+  /// 在给定客户端上直接执行命令，不做任何连接状态等待。
+  ///
+  /// 供 [_doConnect] 的连接后自检使用：自检发生在状态仍为 connecting 时，
+  /// 若复用 [execFull] 会经 `_ensureConnected` 等待「状态变为 connected」，
+  /// 而该状态又要等自检通过才设置，形成永久死锁（界面卡在「连接中」）。
+  Future<ExecResult> _execOn(
+    SSHClient client,
+    String command, {
+    bool isolateEnv = true,
+    Duration? timeout,
+  }) async {
     final full = isolateEnv ? '$envIsolation$command' : command;
 
     try {
